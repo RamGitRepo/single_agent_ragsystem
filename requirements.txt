@@ -1,0 +1,16 @@
+streamlit
+langchain
+openai
+faiss-cpu
+tiktoken
+python-dotenv
+azure-functions
+requests
+pip install pymupdf
+redis
+cachetools
+azure-storage-blob
+azure-monitor-opentelemetry-exporter==1.0.0b40
+AZURE_==REMOVED
+SPEECH_KEY==REMOVED
+SEARCH_KEY==REMOVED
