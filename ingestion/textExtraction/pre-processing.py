@@ -4,7 +4,7 @@ import azure.functions as func
 from keybert import KeyBERT
 from langdetect import detect
 from nltk.tokenize import sent_tokenize
-import spacy, re
+import spacy, re, ast
 import nltk
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from openai import AzureOpenAI
@@ -31,7 +31,6 @@ AZURE_SEARCH_ENDPOINT = ""
 AZURE_SEARCH_INDEX = "rag-index"
 AZURE_SEARCH_KEY = ""
 
-CHUNK_SIZE = 800
 container_name = "contractdata"  # Replace with your actual container name
 # Setup OpenTelemetry Tracer
 trace.set_tracer_provider(
@@ -43,7 +42,6 @@ trace.set_tracer_provider(
 )
 
 AI_CONNECTION_STRING = ()
-
 
 exporter = AzureMonitorTraceExporter.from_connection_string(AI_CONNECTION_STRING)
 
@@ -60,65 +58,101 @@ kw_model = KeyBERT()
 
 def extract_text_from_pdf(pdf_bytes):
     TEXT_THRESHOLD = 50
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    # ✅ Validate input bytes
+    if not pdf_bytes or not isinstance(pdf_bytes, (bytes, bytearray)):
+        logging.error("❌ Invalid or empty PDF byte stream.")
+        raise ValueError("Invalid or empty PDF byte stream")
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        logging.error(f"❌ Failed to open PDF stream with fitz: {e}")
+        raise
+
     # Extract text from each page
     text = "\n".join([page.get_text() for page in doc])
-    text.replace("\n", " ").strip()
+    text = text.replace("\n", " ").strip()
 
     if len(text.strip()) >= TEXT_THRESHOLD:
-        logging.warning(f"Text length {len(text)} is above threshold {TEXT_THRESHOLD}, scanning.")
-        return text  # Return text if it meets the threshold     
-    else:
-        images = [Image.open(io.BytesIO(page.get_pixmap().tobytes())) for page in doc]
-        text = "\n".join([pytesseract.image_to_string(img) for img in images])
-        logging.warning(f"Text length {len(text)} is below threshold {TEXT_THRESHOLD}, skipping.")
+        logging.info(f"✅ Extracted text directly (length: {len(text)} characters)")
         return text
+
+    else:
+        logging.warning(f"ℹ️ Text length {len(text)} is below threshold. Attempting OCR.")
+        try:
+            images = [Image.open(io.BytesIO(page.get_pixmap().tobytes())) for page in doc]
+            text = "\n".join([pytesseract.image_to_string(img) for img in images])
+            return text
+        except Exception as e:
+            logging.error(f"❌ OCR extraction failed: {e}")
+            raise
 
 # ---------------- context aware chunks  --------------------------------
 
-# def chunk_with_llm(text: str, max_tokens: int = 500) -> list:
-    from openai import AzureOpenAI
-
+def semantic_aware_chunks(text: str, max_tokens: int = 500) -> dict:
     client = AzureOpenAI(
-        api_key=os.getenv("AZURE_OPENAI_KEY"),
-        api_version=os.getenv("api_version"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+        api_key=api_key,
+        api_version=api_version,
+        azure_endpoint=api_base
     )
 
     prompt = f"""
-You are a smart assistant helping to chunk large documents into coherent, semantically grouped sections. 
-Each chunk should be no longer than approximately {max_tokens} tokens, and should group sentences that naturally belong together.
-Avoid cutting off ideas or splitting mid-paragraph.
+You are an intelligent assistant helping to preprocess documents.
 
-Respond with a numbered list of chunks from the input text.
+Given the input text:
+1. Split it into **coherent chunks** of about {max_tokens} tokens, preserving sentence integrity.
+2. For each chunk, extract:
+    - Key phrases (topic-specific nouns, concepts, etc.)
+    - Named entities (persons, organizations, locations)
+
+Return the output in this JSON-like format:
+
+[
+  {{
+    "chunk": "...",
+    "entities": ["Entity1", "Entity2"],
+    "key_phrases": ["KeyPhrase1", "KeyPhrase2"]
+  }},
+  ...
+]
 
 Text:
 {text}
-
-Chunks:
 """
 
     try:
         response = client.chat.completions.create(
-            model="gpt-35-turbo",  # or a smaller model if deployed
+            model=DEPLOYMENT_NAME,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=2048
         )
 
-        output = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content.strip()
 
-        # Parse chunks (assuming model returns like "1. ...\n2. ...")
-        chunks = re.split(r'\n\d+\.\s+', output)
-        chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
-        return chunks
+        # Try to parse as Python-like JSON
+        # You could use `ast.literal_eval` or `json.loads` after some precleaning
+        try:
+            json_start = content.find("[")
+            json_end = content.rfind("]") + 1
+            json_str = content[json_start:json_end]
+            parsed = ast.literal_eval(json_str)
+            return parsed
+        except Exception as parse_error:
+            print("[⚠️] Failed to parse JSON structure from model response.")
+            print(content)
+            return {"raw_output": content, "error": str(parse_error)}
+
+    except Exception as e:
+        return {"error": str(e)}
 
     except Exception as e:
         print(f"[LLM Chunking Error] {e}")
         return []
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
-def semantic_aware_chunks(text, max_tokens=500, overlap_sentences=1, sim_threshold=0.6):
+# ---------------- context aware chunks  --------------------------------
+#model = SentenceTransformer("all-MiniLM-L6-v2")
+ #def semantic_aware_chunks(text, max_tokens=500, overlap_sentences=1, sim_threshold=0.6):
     with tracer.start_as_current_span("documentChunking") as span:
          sentences = re.split(r'(?<=[.?!])\s+', text.strip())
          if not sentences:
@@ -184,7 +218,7 @@ def flatten_to_string(nested_list):
     )   
 
 # retrieve text from blob storage
-def retrieve_text_from_blob(container_name, connection_string):
+def retrieve_text_from_blob(container_name, blob_name, connection_string):
     with tracer.start_as_current_span("retrieveBlob") as span:
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
 
@@ -192,14 +226,16 @@ def retrieve_text_from_blob(container_name, connection_string):
         container_client = blob_service_client.get_container_client(container_name)
         for blob in container_client.list_blobs():
             # Step 3: Download each blob
-            if not blob.name.endswith(".json"):
+            if not blob_name.endswith(".json"):
                continue
-
-            blob_client1 = container_client.get_blob_client(blob.name)
+            
+            print(f"blob name: {blob_name}")
+            blob_client1 = container_client.get_blob_client(blob=blob_name)
             try:
             # Try reading and decoding the blob as UTF-8
                 content_bytes = blob_client1.download_blob().readall()
                 content_str = content_bytes  # may fail here
+                print(f"content_str: {content_str}")
                 chunks = json.loads(content_str)
             except UnicodeDecodeError:
                 print(f"❌ Skipping non-UTF-8 blob: {blob.name}")
@@ -214,7 +250,7 @@ def retrieve_text_from_blob(container_name, connection_string):
                 entities = flatten_to_string(chunk_data.get("entities", []))
                 key_phrases = flatten_to_string(chunk_data.get("key_phrases", []))
 
-                doc_id = sanitize_id(blob.name, i)  
+                doc_id = sanitize_id(blob_name, i)  
                 chunk_text = chunk_data["chunk"]
                 response = client.embeddings.create(
                 model=EMBEDDING_ENGINE,
@@ -232,7 +268,7 @@ def retrieve_text_from_blob(container_name, connection_string):
             
                 doc = {
                 "id": doc_id,
-                "source": blob.name,
+                "source": blob_name,
                 "chunk_index": i,
                 "entities": entities,
                 "key_phrases": key_phrases,
@@ -253,25 +289,39 @@ def retrieve_text_from_blob(container_name, connection_string):
 
 def main(blob: func.InputStream):
     with tracer.start_as_current_span("documentCracking") as span:
-         TEXT_THRESHOLD = 50
        
 
          pdf_bytes = blob.read()
+         if not pdf_bytes:
+             logging.error("❌ Blob is empty or unreadable.")
+             raise ValueError("Blob is empty or unreadable")
+    
          text = extract_text_from_pdf(pdf_bytes)
+         print(f"Extracted >>> {text}")
 
         #language = detect(text)
-         chunks = semantic_aware_chunks(text)
-         print(f"Extracted {chunks} semantic-aware chunks from {blob.name}")
-
+         chunk_data = semantic_aware_chunks(text)
+         # Validate format
+         if isinstance(chunk_data, dict) and "error" in chunk_data:
+             logging.error(f"❌ Chunking failed: {chunk_data['error']}")
+             return
+         if not isinstance(chunk_data, list):
+            logging.error(f"❌ Unexpected LLM response format: {type(chunk_data)} — {chunk_data}")
+            return 
+         
          result = []
-         for chunk in chunks:
-             result.append({
-                 "chunk": chunk,
-                 "entities": extract_entities(chunk),
-                 "key_phrases": extract_keywords(chunk)
-             })
+         for i, item in enumerate(chunk_data):
+            if not isinstance(item, dict) or "chunk" not in item:
+               logging.warning(f"⚠️ Skipping invalid item at index {i}: {item}")
+               continue
 
-             print(f"Extracted {len(result)} chunks with entities and key phrases from {blob.name}")
+            result.append({
+                "chunk": item["chunk"],
+                "entities": item.get("entities", []),
+                "key_phrases": item.get("key_phrases", [])
+                })
+            
+         print(f"✅ Extracted {len(result)} chunks with entities and key phrases from {blob.name}")
 
          output_blob_name = f"processed/{Path(blob.name).stem}.json"
          print(f"Uploading processed chunks to blob storage: {output_blob_name}")
@@ -280,10 +330,12 @@ def main(blob: func.InputStream):
                 container_name=container_name,
                 blob_name=output_blob_name,
                 data=result,
-                connection_string="")
+                connection_string=""
+            )
  
        # Upload chunks to Azure Search
-         result=retrieve_text_from_blob(container_name,connection_string="")
+         result=retrieve_text_from_blob(container_name, blob_name=output_blob_name, connection_string=""
+       )
          print(f"✅ Processed and uploaded {len(result)} chunks to Azure Search from {output_blob_name}")
 
 

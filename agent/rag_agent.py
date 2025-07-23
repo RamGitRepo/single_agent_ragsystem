@@ -6,7 +6,7 @@ import sys
 import os
 import uvicorn
 from fastapi.responses import JSONResponse
-import json
+import json, re
 import asyncio
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -17,19 +17,68 @@ from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
 from semantic_kernel import Kernel
 from dotenv import load_dotenv
 load_dotenv()
+from openai import AzureOpenAI
+
 
 tvly_api_key = os.getenv("tvly_api_key")
+
+
+api_version = os.getenv("api_version")
+AZURE_OPENAI_ENDPOINT = ""    # e.g., https://your-resource.openai.azure.com
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_MODEL = "gpt-35-turbo"   # This is the name of your GPT deployment in Azure
+
 # Importing the custom function to get OpenAI response
+
+# --------- plugin for refine query plugin -------------
+class QueryRefinerPlugin:
+    def __init__(self):
+        self.client = AzureOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_KEY"),
+            api_version=os.getenv("api_version"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+        )
+        self.model = "gpt-35-turbo"  # Use your deployed model name
+
+    @kernel_function(name="refine_query", description="Cleans and reframes user input using LLM")
+    async def refine_query(self, query: str) -> str:
+        try:
+            prompt = f"""
+You are a smart assistant that refines casual or vague user queries into clear, structured intent statements.
+Rephrase the input for clarity and remove filler words.
+    
+Original Query: "{query.strip()}"
+Refined Intent:"""
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a query refiner that restructures raw user questions into clean, intent-focused queries."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=60
+            )
+
+            refined_query = response.choices[0].message.content.strip()
+            print(f"\n[QueryRefinerPlugin] Refined: {refined_query}")
+            return refined_query
+
+        except Exception as e:
+            fallback = f"Refined intent from user: {query.strip().capitalize()}."
+            print(f"[QueryRefinerPlugin] ⚠️ Fallback due to error: {e}")
+            return fallback
 
 # --------- plugin for web search -------------
 class SearchSkillPlugin:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.endpoint = "xxxx"
+        self.endpoint = "https://api.tavily.com/search"
 
     @kernel_function(name="search_resources")
     async def search(self, query: str) -> str:
         try:
+            print(f"Agent search_resources: {query}")
             headers = {"Content-Type": "application/json"}
             payload = {
                 "api_key": self.api_key,
@@ -57,9 +106,9 @@ class SearchSkillPlugin:
  
 class cvSkillsPlugin:
     def __init__(self):
-        self.local_function_url = "http://localhost"
+        self.local_function_url = "http://localhost:7071/api/rag-query"
 
-    @kernel_function()
+    @kernel_function(name="get_skills", description="Extracts CV skills from full user_input and conversation_id")
     async def get_skills(self, user_input: str, conversation_id : str) -> str:
         try:
            print(f"Agent get_skills: {user_input}")
@@ -98,29 +147,30 @@ def get_azure_kernel():
 # --------- run agent -------------
 async def run_sk_agent(user_input, conversation_id):
     kernel = get_azure_kernel()
+    
+    refine_plugin = QueryRefinerPlugin()
     cv_plugin = cvSkillsPlugin()
     search_plugin = SearchSkillPlugin(api_key=tvly_api_key)
+    
 
-    #ßskills = await cv_plugin.get_skills_with_context(user_input, conversation_id)
+    #skills = await cv_plugin.get_skills_with_context(user_input, conversation_id)
+    #refined_query = refine_plugin.refine_query(user_input)
 
     agent = ChatCompletionAgent(
         service=kernel.get_service("azure-chat"),
         name="azure-agent",
         instructions=(
             "You are a concise and structured career assistant.\n"
-            "Step 1: Call 'get_skills(user_input, conversation_id)' with the full user message as `user_input to retrieve the user's current skill summary from their CV. "
-            "Return this exactly as received, as the **first part** of your final response.\n"
-            "Step 2: Call 'search_resources(skills)' to retrieve skill improvement suggestions.\n"
-            "Step 3: Combine both pieces into one response with this structure:\n\n"
-            "✅ CV Summary:\n<output from get_skills>\n\n"
-            "✅ Skills to Improve:\n<bullet list from search_resources>\n\n"
-            "Do not change or paraphrase the CV summary. Do not include user names or roles unless explicitly mentioned in the output. Do not add any introductions like 'Based on the CV'."
+            "Step 1: Call refine_query(user_input) to clean and normalize the user's query.\n"
+            "Step 2: Call get_skills(refined_query, conversation_id) to retrieve the user's current skill summary from their CV. return this exactly as received, as the **first part** of your final response.\n"
+            "Step 3: Call search_resources(refined_query) to compare the user's current skill and suggest additional skills required or any skills lacks. also recommend any skillset improvement based on user retrieved message from get_skills.\n"
+            "Step 4: for this refined_query and with the retrieved message from get_skills generate the optimal response.\n\n"
+            "Do not change or paraphrasthe CV summary. Do not include user names or roles unless explicitly mentioned in the output. Do not add any introductions like 'Based on the CV'."
         ),
-        plugins=[cv_plugin, search_plugin]
+        plugins=[refine_plugin, cv_plugin, search_plugin]   
     )
-    combined_input = f"{user_input}\n\n[conversation_id: {conversation_id}]"
+    combined_input = f"[user_input:{user_input}]\n\n[conversation_id:{conversation_id}]"
     response = await agent.get_response(combined_input)
-    print(f"Agent response: {response}")
     return response.content
 
 # ---- FastAPI App ----
