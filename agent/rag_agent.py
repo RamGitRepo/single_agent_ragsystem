@@ -8,8 +8,12 @@ import uvicorn
 from fastapi.responses import JSONResponse
 import json, re
 import asyncio
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import redis
 
+from agent import agtcache_memory
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import hashlib
+import json
 # Assuming HttpTriggerRAG is a module in the same directory, import it correctly
 from semantic_kernel.agents import ChatCompletionAgent
 from semantic_kernel.functions import kernel_function
@@ -19,16 +23,13 @@ from dotenv import load_dotenv
 load_dotenv()
 from openai import AzureOpenAI
 
-
 tvly_api_key = os.getenv("tvly_api_key")
-
 
 api_version = os.getenv("api_version")
 AZURE_OPENAI_ENDPOINT = ""    # e.g., https://your-resource.openai.azure.com
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 AZURE_OPENAI_MODEL = "gpt-35-turbo"   # This is the name of your GPT deployment in Azure
 
-# Importing the custom function to get OpenAI response
 
 # --------- plugin for refine query plugin -------------
 class QueryRefinerPlugin:
@@ -44,11 +45,11 @@ class QueryRefinerPlugin:
     async def refine_query(self, query: str) -> str:
         try:
             prompt = f"""
-You are a smart assistant that refines casual or vague user queries into clear, structured intent statements.
-Rephrase the input for clarity and remove filler words.
-    
-Original Query: "{query.strip()}"
-Refined Intent:"""
+            You are a smart assistant that refines casual or vague user queries into clear, structured intent statements.
+            Rephrase the input for clarity and remove filler words.
+
+            Original Query: "{query.strip()}"
+            Refined Intent:"""
 
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -146,8 +147,15 @@ def get_azure_kernel():
 
 # --------- run agent -------------
 async def run_sk_agent(user_input, conversation_id):
+
+     # --- Cache Check ---
+    answer_cache_key = f"answer:{conversation_id}:{user_input}"
+    cached_answer = agtcache_memory.get(answer_cache_key)
+    if cached_answer:
+        print(f"Output Cached Answer: {cached_answer}")
+        return cached_answer    
+
     kernel = get_azure_kernel()
-    
     refine_plugin = QueryRefinerPlugin()
     cv_plugin = cvSkillsPlugin()
     search_plugin = SearchSkillPlugin(api_key=tvly_api_key)
@@ -171,7 +179,12 @@ async def run_sk_agent(user_input, conversation_id):
     )
     combined_input = f"[user_input:{user_input}]\n\n[conversation_id:{conversation_id}]"
     response = await agent.get_response(combined_input)
-    return response.content
+
+    agent_response = str(response.content).strip()  # Ensures it's string, not custom object
+    agtcache_memory.append(conversation_id, "user", user_input)
+    agtcache_memory.append(conversation_id, "assistant", agent_response)
+    agtcache_memory.set(answer_cache_key, agent_response)
+    return agent_response
 
 # ---- FastAPI App ----
 app = FastAPI()
@@ -191,7 +204,7 @@ class ChatRequest(BaseModel):
 @app.post("/api/agtchat")
 async def chat(req: ChatRequest):
     answer = await run_sk_agent(req.Question, req.conversation_id)
-    return answer
+    return JSONResponse(content={"answer": answer})
 
 if __name__ == "__main__":
     uvicorn.run("rag_agent:app", host="0.0.0.0", port=7080, reload=True)
