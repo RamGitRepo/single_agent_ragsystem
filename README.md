@@ -3,7 +3,7 @@
 
 
 
-### 💼 `AI Career Assistant – Semantic Kernel + RAG + Plugin Orchestration`
+### 💼 `AI Career Assistant – Agentic RAG`
 
 This project is an intelligent **AI Career Assistant** built using **FastAPI**, **Semantic Kernel**, and **Azure OpenAI**, enhanced with **RAG (Retrieval-Augmented Generation)** and **plugin orchestration**.
 It performs real-time CV skill extraction, leverages external search APIs, and returns actionable insights — all grounded in retrieved content.
