@@ -1,9 +1,8 @@
 <img width="1071" height="842" alt="arch" src="https://github.com/user-attachments/assets/1bb721ad-57f2-4e9e-9e78-f15d38db7fc5" />
 
 
-
-
 ### 💼 `AI Career Assistant – Agentic RAG`
+
 
 This project is an intelligent **AI Career Assistant** built using **FastAPI**, **Semantic Kernel**, and **Azure OpenAI**, enhanced with **RAG (Retrieval-Augmented Generation)** and **plugin orchestration**.
 It performs real-time CV skill extraction, leverages external search APIs, and returns actionable insights — all grounded in retrieved content.
